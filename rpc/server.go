@@ -2,7 +2,6 @@ package rpc
 
 import (
 	"encoding/json"
-	"io/ioutil"
 	"net/http"
 	"runtime/debug"
 	"strings"
@@ -34,26 +33,30 @@ func handleJSONRPC(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	if strings.EqualFold(req.Method, "POST") {
-		var messageBatch []map[string]any
-		var message map[string]any
+		var message any
 
-		body, _ := ioutil.ReadAll(req.Body)
-
-		errBatch := json.Unmarshal(body, &messageBatch)
-		err := json.Unmarshal(body, &message)
-
-		if errBatch != nil && err != nil {
+		err := json.NewDecoder(req.Body).Decode(message)
+		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			sendErrorResponse(w, -32700, "Cannot parse invalid JSON data.")
 			return
 		}
-		if messageBatch != nil {
+
+		_, okBatch := message.([]map[string]any)
+		if okBatch {
 			w.WriteHeader(http.StatusBadRequest)
 			sendErrorResponse(w, -32700, "Batches are not supported")
 			return
 		}
 
-		handleJSONRPCMessage(w, message)
+		_, ok := message.(map[string]any)
+		if ok {
+			handleJSONRPCMessage(w, message.(map[string]any))
+			return
+		}
+
+		w.WriteHeader(http.StatusBadRequest)
+		sendErrorResponse(w, -32700, "JSON must have an array or object as root.")
 		return
 	}
 
