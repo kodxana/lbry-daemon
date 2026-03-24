@@ -1,13 +1,18 @@
 package rpc
 
 import (
+	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"runtime/debug"
 	"strconv"
 	"strings"
+
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 func CreateServer() http.Server {
@@ -253,6 +258,7 @@ func handleJSONRPCMessageAddressUnused(w http.ResponseWriter, params any) {
 
 func handleJSONRPCMessageBlobAnnounce(w http.ResponseWriter, params any) {
 	// Relaxed
+	sendErrorResponse(w, 501, "NOT IMPLEMENTED")
 }
 
 func handleJSONRPCMessageBlobClean(w http.ResponseWriter, params any) {
@@ -303,8 +309,125 @@ func handleJSONRPCMessageClaimList(w http.ResponseWriter, params any) {
 	sendErrorResponse(w, 501, "Commands that require having a wallet are not implemented for now.")
 }
 
+func SendJSON(host string, port int, req any) (map[string]any, error) {
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	data, _ := json.Marshal(req)
+
+	conn.Write(append(data, '\n'))
+
+	line, _ := bufio.NewReader(conn).ReadString('\n')
+	if len(line) > 0 && line[len(line)-1] == '\n' {
+		line = line[:len(line)-1]
+	}
+	if len(line) > 0 && line[len(line)-1] == '\r' {
+		line = line[:len(line)-1]
+	}
+
+	var resp map[string]any
+	json.Unmarshal([]byte(line), &resp)
+	return resp, nil
+}
+
+func DecodeRawProto(b []byte) (map[int]any, error) {
+	m := make(map[int]any)
+
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b) // num is protowire.Number
+		if n < 0 {
+			return nil, fmt.Errorf("invalid tag")
+		}
+		b = b[n:]
+
+		var val any
+		var consumed int
+
+		switch typ {
+		case protowire.VarintType:
+			val, consumed = protowire.ConsumeVarint(b)
+		case protowire.Fixed32Type:
+			val, consumed = protowire.ConsumeFixed32(b)
+		case protowire.Fixed64Type:
+			val, consumed = protowire.ConsumeFixed64(b)
+		case protowire.BytesType:
+			val, consumed = protowire.ConsumeBytes(b)
+			// Recursive decode for nested messages
+			if sub, err := DecodeRawProto(val.([]byte)); err == nil && len(sub) > 0 {
+				val = sub
+			}
+		default:
+			return nil, fmt.Errorf("unsupported wire type %d for field %d", typ, num)
+		}
+		if consumed < 0 {
+			return nil, fmt.Errorf("consume failed for field %d", num)
+		}
+		b = b[consumed:]
+
+		// Handle repeating fields (multiple same field number)
+		key := int(num) // <-- this fixes the compile error
+		if existing, ok := m[key]; ok {
+			if slice, ok := existing.([]any); ok {
+				m[key] = append(slice, val)
+			} else {
+				m[key] = []any{existing, val}
+			}
+		} else {
+			m[key] = val
+		}
+	}
+	return m, nil
+}
+
 func handleJSONRPCMessageClaimSearch(w http.ResponseWriter, params any) {
 	// Relaxed
+	searchResp, _ := SendJSON("s1.lbry.network", 50001, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "123",
+		"method":  "blockchain.claimtrie.search",
+		"params":  params,
+	})
+
+	decodedBase64, _ := base64.StdEncoding.DecodeString(searchResp["result"].(string))
+	decodedProtobuf, _ := DecodeRawProto(decodedBase64)
+
+	var items []map[string]any = []map[string]any{}
+
+	claims, ok := decodedProtobuf[1].([]any)
+	if ok {
+		for _, claim := range claims {
+			claimMap := claim.(map[int]any)
+			claimMap7 := (claimMap[7]).(map[int]any)
+
+			uriBase64 := claimMap7[4].([]uint8)
+			uri := string(uriBase64)
+
+			item := map[string]any{
+				"canonical_url": "lbry://" + uri,
+			}
+
+			items = append(items, item)
+		}
+	}
+
+	totalItems, okTotal := (decodedProtobuf[3]).(uint64)
+
+	var pageSize float64 = 20
+	var totalItemsFloat float64 = 0
+	if okTotal {
+		totalItemsFloat = float64(totalItems)
+	}
+
+	sendResultResponse(w, map[string]any{
+		"items":       items,
+		"page":        1,
+		"page_size":   pageSize,
+		"total_items": totalItems,
+		"total_pages": math.Ceil(totalItemsFloat / pageSize),
+	})
 }
 
 func handleJSONRPCMessageCollectionAbandon(w http.ResponseWriter, params any) {
@@ -321,6 +444,7 @@ func handleJSONRPCMessageCollectionList(w http.ResponseWriter, params any) {
 
 func handleJSONRPCMessageCollectionResolve(w http.ResponseWriter, params any) {
 	// Relaxed
+	sendErrorResponse(w, 501, "NOT IMPLEMENTED")
 }
 
 func handleJSONRPCMessageCollectionUpdate(w http.ResponseWriter, params any) {
@@ -353,6 +477,7 @@ func handleJSONRPCMessageFileSetStatus(w http.ResponseWriter, params any) {
 
 func handleJSONRPCMessageGet(w http.ResponseWriter, params any) {
 	// Relaxed
+	sendErrorResponse(w, 501, "NOT IMPLEMENTED")
 }
 
 func handleJSONRPCMessagePeerList(w http.ResponseWriter, params any) {
@@ -385,10 +510,68 @@ func handleJSONRPCMessagePurchaseList(w http.ResponseWriter, params any) {
 
 func handleJSONRPCMessageResolve(w http.ResponseWriter, params any) {
 	// Relaxed
+	var paramsMap map[string]any = params.(map[string]any)
+
+	_, ok := paramsMap["urls"].([]any)
+
+	var urls []any = []any{}
+
+	if ok {
+		urls = paramsMap["urls"].([]any)
+	}
+
+	resolveResp, _ := SendJSON("s1.lbry.network", 50001, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "123",
+		"method":  "blockchain.claimtrie.resolve",
+		"params":  urls,
+	})
+
+	var resolutions map[string]any = map[string]any{}
+
+	_, resultIsString := resolveResp["result"].(string)
+	if resultIsString {
+		decodedBase64, _ := base64.StdEncoding.DecodeString(resolveResp["result"].(string))
+		decodedProtobuf, _ := DecodeRawProto(decodedBase64)
+
+		var resolutionData []any
+
+		_, okResolution := decodedProtobuf[1].([]any)
+		if okResolution {
+			resolutionData = decodedProtobuf[1].([]any)
+		} else {
+			resolutionData = []any{decodedProtobuf[1]}
+		}
+
+		for index, claim := range resolutionData {
+			var item map[string]any
+
+			claimMap, ok := claim.(map[int]any)
+			if ok {
+				claimMap7 := (claimMap[7]).(map[int]any)
+
+				uriBase64 := claimMap7[4].([]uint8)
+				uri := string(uriBase64)
+
+				item = map[string]any{
+					"canonical_url": "lbry://" + uri,
+				}
+			}
+
+			if ok {
+				resolutionKey := urls[index].(string)
+				resolutions[resolutionKey] = item
+			}
+
+		}
+	}
+
+	sendResultResponse(w, resolutions)
 }
 
 func handleJSONRPCMessageRoutingTableGet(w http.ResponseWriter, params any) {
 	// Relaxed
+	sendErrorResponse(w, 501, "NOT IMPLEMENTED")
 }
 
 func handleJSONRPCMessageSettingsClear(w http.ResponseWriter, params any) {
@@ -405,7 +588,9 @@ func handleJSONRPCMessageSettingsSet(w http.ResponseWriter, params any) {
 
 func handleJSONRPCMessageStatus(w http.ResponseWriter, params any) {
 	// Relaxed
-	sendResultResponse(w, map[string]any{})
+	sendResultResponse(w, map[string]any{
+		"is_running": true,
+	})
 }
 
 func handleJSONRPCMessageStop(w http.ResponseWriter, params any) {
@@ -418,6 +603,7 @@ func handleJSONRPCMessageStreamAbandon(w http.ResponseWriter, params any) {
 
 func handleJSONRPCMessageStreamCostEstimate(w http.ResponseWriter, params any) {
 	// Relaxed
+	sendErrorResponse(w, 501, "NOT IMPLEMENTED")
 }
 
 func handleJSONRPCMessageStreamCreate(w http.ResponseWriter, params any) {
@@ -478,6 +664,7 @@ func handleJSONRPCMessageTransactionList(w http.ResponseWriter, params any) {
 
 func handleJSONRPCMessageTransactionShow(w http.ResponseWriter, params any) {
 	// Relaxed
+	sendErrorResponse(w, 501, "NOT IMPLEMENTED")
 }
 
 func handleJSONRPCMessageTxoList(w http.ResponseWriter, params any) {
@@ -506,17 +693,17 @@ func handleJSONRPCMessageUtxoRelease(w http.ResponseWriter, params any) {
 
 func handleJSONRPCMessageVersion(w http.ResponseWriter, params any) {
 	// Relaxed
-	info, _ := debug.ReadBuildInfo()
+	_, _ = debug.ReadBuildInfo()
 
 	sendResultResponse(w, map[string]any{
 		"build":           nil,
-		"lbrynet_version": nil,
+		"lbrynet_version": "0.113.0",
 		"os_release":      nil,
 		"os_system":       nil,
 		"platform":        nil,
 		"processor":       nil,
 		"python_version":  nil,
-		"version":         info.Main.Version,
+		"version":         "0.113.0",
 	})
 }
 
@@ -569,7 +756,8 @@ func handleJSONRPCMessageWalletSend(w http.ResponseWriter, params any) {
 }
 
 func handleJSONRPCMessageWalletStatus(w http.ResponseWriter, params any) {
-	sendErrorResponse(w, 501, "Wallet commands are not implemented for now.")
+	//sendErrorResponse(w, 501, "Wallet commands are not implemented for now.")
+	sendResultResponse(w, map[string]any{})
 }
 
 func handleJSONRPCMessageWalletUnlock(w http.ResponseWriter, params any) {
