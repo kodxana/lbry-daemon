@@ -18,6 +18,17 @@ import (
 
 const preferencesFile = "preferences.json"
 
+// streamManager is an interface to avoid circular imports.
+type StreamManagerInterface interface {
+	GetStreamingURL(sdHash string, port int) string
+}
+
+var streamManager StreamManagerInterface
+
+func SetStreamManager(sm StreamManagerInterface) {
+	streamManager = sm
+}
+
 func CreateServer() http.Server {
 	rpcServeMux := http.NewServeMux()
 	rpcServeMux.HandleFunc("/", handleJSONRPC)
@@ -811,8 +822,148 @@ func handleJSONRPCMessageCollectionList(w http.ResponseWriter, params any) {
 }
 
 func handleJSONRPCMessageCollectionResolve(w http.ResponseWriter, params any) {
-	// Relaxed
-	sendErrorResponse(w, 501, "NOT IMPLEMENTED")
+	paramsMap, ok := params.(map[string]any)
+	if !ok {
+		sendErrorResponse(w, -32600, "Invalid params")
+		return
+	}
+
+	claimID, _ := paramsMap["claim_id"].(string)
+	url, _ := paramsMap["url"].(string)
+
+	// Step 1: Find the collection via claim_search (works with both claim_id and url)
+	searchParams := map[string]any{"limit": 1}
+	if claimID != "" {
+		searchParams["claim_ids"] = []any{claimID}
+	} else if url != "" {
+		// Resolve by URL first, then get its claim data
+		resolveResp, err := SendJSON("s1.lbry.network", 50001, map[string]any{
+			"jsonrpc": "2.0", "id": "1",
+			"method": "blockchain.claimtrie.resolve",
+			"params": []any{url},
+		})
+		if err != nil {
+			sendErrorResponse(w, -32000, "Hub connection error")
+			return
+		}
+		resultStr, ok := resolveResp["result"].(string)
+		if !ok {
+			sendErrorResponse(w, -32000, "Collection not found")
+			return
+		}
+		outputs, txMap, err := decodeHubResponse(resultStr)
+		if err != nil || len(outputs.Txos) == 0 {
+			sendErrorResponse(w, -32000, "Collection not found")
+			return
+		}
+		collection := inflateOutput(outputs.Txos[0], txMap, outputs.ExtraTxos)
+		value, _ := collection["value"].(map[string]any)
+		collectionClaimIDs, _ := value["claims"].([]string)
+		if len(collectionClaimIDs) == 0 {
+			sendResultResponse(w, map[string]any{"items": []any{}, "total_items": 0})
+			return
+		}
+		// Now search for these claims
+		return // handled inline below after extracting claim IDs
+	} else {
+		sendErrorResponse(w, -32600, "Missing 'claim_id' or 'url'")
+		return
+	}
+
+	// Search for the collection by claim_id
+	collSearchResp, err := SendJSON("s1.lbry.network", 50001, map[string]any{
+		"jsonrpc": "2.0", "id": "1",
+		"method": "blockchain.claimtrie.search",
+		"params": searchParams,
+	})
+	if err != nil {
+		sendErrorResponse(w, -32000, "Hub connection error")
+		return
+	}
+	collResultStr, ok := collSearchResp["result"].(string)
+	if !ok {
+		sendErrorResponse(w, -32000, "Collection not found")
+		return
+	}
+	collOutputs, collTxMap, err := decodeHubResponse(collResultStr)
+	if err != nil || len(collOutputs.Txos) == 0 {
+		sendErrorResponse(w, -32000, "Collection not found")
+		return
+	}
+
+	collection := inflateOutput(collOutputs.Txos[0], collTxMap, collOutputs.ExtraTxos)
+	value, _ := collection["value"].(map[string]any)
+	itemClaimIDs, _ := value["claims"].([]string)
+
+	if len(itemClaimIDs) == 0 {
+		sendResultResponse(w, map[string]any{"items": []any{}, "total_items": 0})
+		return
+	}
+
+	// Step 2: Pagination
+	page := 1
+	pageSize := 20
+	if p, ok := paramsMap["page"].(float64); ok {
+		page = int(p)
+	}
+	if ps, ok := paramsMap["page_size"].(float64); ok {
+		pageSize = int(ps)
+	}
+	if page < 1 {
+		page = 1
+	}
+	totalItems := len(itemClaimIDs)
+	start := (page - 1) * pageSize
+	end := start + pageSize
+	if start > totalItems {
+		start = totalItems
+	}
+	if end > totalItems {
+		end = totalItems
+	}
+	pageIDs := itemClaimIDs[start:end]
+
+	// Step 3: Search for the page of claims by claim_ids
+	pageIDsAny := make([]any, len(pageIDs))
+	for i, id := range pageIDs {
+		pageIDsAny[i] = id
+	}
+
+	itemSearchResp, err := SendJSON("s1.lbry.network", 50001, map[string]any{
+		"jsonrpc": "2.0", "id": "2",
+		"method": "blockchain.claimtrie.search",
+		"params": map[string]any{
+			"claim_ids": pageIDsAny,
+			"limit":     pageSize,
+		},
+	})
+	if err != nil {
+		sendErrorResponse(w, -32000, "Hub connection error resolving items")
+		return
+	}
+	itemResultStr, ok := itemSearchResp["result"].(string)
+	if !ok {
+		sendResultResponse(w, map[string]any{"items": []any{}, "total_items": totalItems})
+		return
+	}
+	itemOutputs, itemTxMap, err := decodeHubResponse(itemResultStr)
+	if err != nil {
+		sendResultResponse(w, map[string]any{"items": []any{}, "total_items": totalItems})
+		return
+	}
+
+	items := make([]map[string]any, 0, len(itemOutputs.Txos))
+	for _, txo := range itemOutputs.Txos {
+		items = append(items, inflateOutput(txo, itemTxMap, itemOutputs.ExtraTxos))
+	}
+
+	sendResultResponse(w, map[string]any{
+		"items":       items,
+		"total_items": totalItems,
+		"page":        page,
+		"page_size":   pageSize,
+		"total_pages": (totalItems + pageSize - 1) / pageSize,
+	})
 }
 
 func handleJSONRPCMessageCollectionUpdate(w http.ResponseWriter, params any) {
@@ -888,9 +1039,13 @@ func handleJSONRPCMessageGet(w http.ResponseWriter, params any) {
 	name, _ := claim["name"].(string)
 	claimID, _ := claim["claim_id"].(string)
 
-	// Construct streaming URL via CDN (v3 API, first 6 chars of sd_hash)
+	// Use P2P streaming if DHT is available, otherwise fall back to CDN
 	streamingURL := ""
-	if sdHash != "" && name != "" && claimID != "" {
+	if sdHash != "" && streamManager != nil {
+		// P2P: stream through local HTTP server backed by DHT blob downloads
+		streamingURL = streamManager.GetStreamingURL(sdHash, 5280)
+	} else if sdHash != "" && name != "" && claimID != "" {
+		// Fallback: Odysee CDN
 		sdHashPrefix := sdHash
 		if len(sdHashPrefix) > 6 {
 			sdHashPrefix = sdHashPrefix[:6]
@@ -901,15 +1056,22 @@ func handleJSONRPCMessageGet(w http.ResponseWriter, params any) {
 		)
 	}
 
+	streamingSource := "cdn"
+	if sdHash != "" && streamManager != nil {
+		streamingSource = "p2p"
+	}
+	fmt.Printf("GET %s → %s (%s)\n", name, streamingSource, streamingURL)
+
 	sendResultResponse(w, map[string]any{
-		"streaming_url": streamingURL,
-		"stream_hash":   sdHash,
-		"sd_hash":       sdHash,
-		"completed":     true,
-		"claim_id":      claimID,
-		"claim_name":    name,
-		"mime_type":     source["media_type"],
-		"metadata":      value,
+		"streaming_url":    streamingURL,
+		"streaming_source": streamingSource,
+		"stream_hash":      sdHash,
+		"sd_hash":          sdHash,
+		"completed":        true,
+		"claim_id":         claimID,
+		"claim_name":       name,
+		"mime_type":        source["media_type"],
+		"metadata":         value,
 	})
 }
 
