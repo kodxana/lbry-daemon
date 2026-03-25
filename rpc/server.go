@@ -8,15 +8,12 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"os"
 	"runtime/debug"
 	"strconv"
 	"strings"
 
 	"google.golang.org/protobuf/encoding/protowire"
 )
-
-const preferencesFile = "preferences.json"
 
 func CreateServer() http.Server {
 	rpcServeMux := http.NewServeMux()
@@ -32,7 +29,7 @@ func StartServer(rpcServer http.Server, port int) {
 		return
 	}
 
-	fmt.Printf("lbryd v0.113.0 listening on port %d\n", port)
+	fmt.Printf("LBRYd listening on port %d\n", port)
 
 	err = rpcServer.Serve(listener)
 	if err != nil && err != http.ErrServerClosed {
@@ -63,7 +60,7 @@ func handleJSONRPC(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
-	if req.Method == "OPTIONS" {
+	if strings.EqualFold(req.Method, "OPTIONS") {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -397,146 +394,6 @@ func DecodeRawProto(b []byte) (map[int]any, error) {
 	return m, nil
 }
 
-// --- Hub Outputs protobuf types ---
-
-type HubOutput struct {
-	TxHash []byte
-	Nout   uint32
-	Height uint32
-	Meta   *HubClaimMeta
-}
-
-type HubClaimMeta struct {
-	CanonicalURL    string
-	ShortURL        string
-	IsControlling   bool
-	CreationHeight  uint32
-	EffectiveAmount uint64
-	SupportAmount   uint64
-	ClaimsInChannel uint32
-	Reposted        uint32
-	ChannelTxHash   []byte
-	ChannelNout     uint32
-	HasChannel      bool
-}
-
-type HubOutputs struct {
-	Txos      []HubOutput
-	ExtraTxos []HubOutput
-	Total     uint32
-}
-
-func decodeOutputs(data []byte) (*HubOutputs, error) {
-	result := &HubOutputs{}
-	for b := data; len(b) > 0; {
-		num, typ, n := protowire.ConsumeTag(b)
-		if n < 0 {
-			break
-		}
-		b = b[n:]
-		fieldLen := protowire.ConsumeFieldValue(num, typ, b)
-		if fieldLen < 0 {
-			break
-		}
-		switch {
-		case typ == protowire.BytesType && num == 1: // txos
-			val, _ := protowire.ConsumeBytes(b)
-			result.Txos = append(result.Txos, decodeHubOutput(val))
-		case typ == protowire.BytesType && num == 2: // extra_txos
-			val, _ := protowire.ConsumeBytes(b)
-			result.ExtraTxos = append(result.ExtraTxos, decodeHubOutput(val))
-		case typ == protowire.VarintType && num == 3: // total
-			val, _ := protowire.ConsumeVarint(b)
-			result.Total = uint32(val)
-		}
-		b = b[fieldLen:]
-	}
-	return result, nil
-}
-
-func decodeHubOutput(data []byte) HubOutput {
-	out := HubOutput{}
-	for b := data; len(b) > 0; {
-		num, typ, n := protowire.ConsumeTag(b)
-		if n < 0 {
-			break
-		}
-		b = b[n:]
-		fieldLen := protowire.ConsumeFieldValue(num, typ, b)
-		if fieldLen < 0 {
-			break
-		}
-		switch {
-		case typ == protowire.BytesType && num == 1: // tx_hash
-			val, _ := protowire.ConsumeBytes(b)
-			out.TxHash = make([]byte, len(val))
-			copy(out.TxHash, val)
-		case typ == protowire.VarintType && num == 2: // nout
-			val, _ := protowire.ConsumeVarint(b)
-			out.Nout = uint32(val)
-		case typ == protowire.VarintType && num == 3: // height
-			val, _ := protowire.ConsumeVarint(b)
-			out.Height = uint32(val)
-		case typ == protowire.BytesType && num == 7: // ClaimMeta
-			val, _ := protowire.ConsumeBytes(b)
-			out.Meta = decodeClaimMeta(val)
-		}
-		b = b[fieldLen:]
-	}
-	return out
-}
-
-func decodeClaimMeta(data []byte) *HubClaimMeta {
-	meta := &HubClaimMeta{}
-	for b := data; len(b) > 0; {
-		num, typ, n := protowire.ConsumeTag(b)
-		if n < 0 {
-			break
-		}
-		b = b[n:]
-		fieldLen := protowire.ConsumeFieldValue(num, typ, b)
-		if fieldLen < 0 {
-			break
-		}
-		switch {
-		case typ == protowire.BytesType && num == 1: // channel reference
-			val, _ := protowire.ConsumeBytes(b)
-			ch := decodeHubOutput(val)
-			if len(ch.TxHash) > 0 {
-				meta.ChannelTxHash = ch.TxHash
-				meta.ChannelNout = ch.Nout
-				meta.HasChannel = true
-			}
-		case typ == protowire.BytesType && num == 3: // short_url
-			val, _ := protowire.ConsumeBytes(b)
-			meta.ShortURL = string(val)
-		case typ == protowire.BytesType && num == 4: // canonical_url
-			val, _ := protowire.ConsumeBytes(b)
-			meta.CanonicalURL = string(val)
-		case typ == protowire.VarintType && num == 5: // is_controlling
-			val, _ := protowire.ConsumeVarint(b)
-			meta.IsControlling = val != 0
-		case typ == protowire.VarintType && num == 7: // creation_height
-			val, _ := protowire.ConsumeVarint(b)
-			meta.CreationHeight = uint32(val)
-		case typ == protowire.VarintType && num == 10: // claims_in_channel
-			val, _ := protowire.ConsumeVarint(b)
-			meta.ClaimsInChannel = uint32(val)
-		case typ == protowire.VarintType && num == 11: // reposted
-			val, _ := protowire.ConsumeVarint(b)
-			meta.Reposted = uint32(val)
-		case typ == protowire.VarintType && num == 20: // effective_amount
-			val, _ := protowire.ConsumeVarint(b)
-			meta.EffectiveAmount = val
-		case typ == protowire.VarintType && num == 21: // support_amount
-			val, _ := protowire.ConsumeVarint(b)
-			meta.SupportAmount = val
-		}
-		b = b[fieldLen:]
-	}
-	return meta
-}
-
 // --- Helpers ---
 
 // SendJSONBatch sends multiple JSON-RPC requests over a single TCP connection.
@@ -844,73 +701,8 @@ func handleJSONRPCMessageFileSetStatus(w http.ResponseWriter, params any) {
 }
 
 func handleJSONRPCMessageGet(w http.ResponseWriter, params any) {
-	paramsMap, ok := params.(map[string]any)
-	if !ok {
-		sendErrorResponse(w, -32600, "Invalid params")
-		return
-	}
-
-	uri, _ := paramsMap["uri"].(string)
-	if uri == "" {
-		sendErrorResponse(w, -32600, "Missing 'uri' parameter")
-		return
-	}
-
-	// Resolve the claim
-	resolveResp, err := SendJSON("s1.lbry.network", 50001, map[string]any{
-		"jsonrpc": "2.0",
-		"id":      "1",
-		"method":  "blockchain.claimtrie.resolve",
-		"params":  []any{uri},
-	})
-	if err != nil {
-		sendErrorResponse(w, -32000, "Hub connection error")
-		return
-	}
-
-	resultStr, ok := resolveResp["result"].(string)
-	if !ok {
-		sendErrorResponse(w, -32000, "Invalid hub response")
-		return
-	}
-
-	outputs, txMap, err := decodeHubResponse(resultStr)
-	if err != nil || len(outputs.Txos) == 0 {
-		sendErrorResponse(w, -32000, "Claim not found")
-		return
-	}
-
-	claim := inflateOutput(outputs.Txos[0], txMap, outputs.ExtraTxos)
-
-	value, _ := claim["value"].(map[string]any)
-	source, _ := value["source"].(map[string]any)
-	sdHash, _ := source["sd_hash"].(string)
-	name, _ := claim["name"].(string)
-	claimID, _ := claim["claim_id"].(string)
-
-	// Construct streaming URL via CDN (v3 API, first 6 chars of sd_hash)
-	streamingURL := ""
-	if sdHash != "" && name != "" && claimID != "" {
-		sdHashPrefix := sdHash
-		if len(sdHashPrefix) > 6 {
-			sdHashPrefix = sdHashPrefix[:6]
-		}
-		streamingURL = fmt.Sprintf(
-			"https://player.odycdn.com/api/v3/streams/free/%s/%s/%s",
-			name, claimID, sdHashPrefix,
-		)
-	}
-
-	sendResultResponse(w, map[string]any{
-		"streaming_url": streamingURL,
-		"stream_hash":   sdHash,
-		"sd_hash":       sdHash,
-		"completed":     true,
-		"claim_id":      claimID,
-		"claim_name":    name,
-		"mime_type":     source["media_type"],
-		"metadata":      value,
-	})
+	// Relaxed
+	sendErrorResponse(w, 501, "NOT IMPLEMENTED")
 }
 
 func handleJSONRPCMessagePeerList(w http.ResponseWriter, params any) {
@@ -921,75 +713,12 @@ func handleJSONRPCMessagePeerPing(w http.ResponseWriter, params any) {
 	sendErrorResponse(w, 401, "Not exposed for now.")
 }
 
-func loadPreferences() map[string]any {
-	data, err := os.ReadFile(preferencesFile)
-	if err != nil {
-		return map[string]any{
-			"local": map[string]any{
-				"subscriptions": []any{},
-				"tags":          []any{},
-			},
-		}
-	}
-	var prefs map[string]any
-	if json.Unmarshal(data, &prefs) != nil {
-		return map[string]any{
-			"local": map[string]any{
-				"subscriptions": []any{},
-				"tags":          []any{},
-			},
-		}
-	}
-	return prefs
-}
-
-func savePreferences(prefs map[string]any) error {
-	data, err := json.MarshalIndent(prefs, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(preferencesFile, data, 0644)
-}
-
 func handleJSONRPCMessagePreferenceGet(w http.ResponseWriter, params any) {
-	prefs := loadPreferences()
-
-	paramsMap, _ := params.(map[string]any)
-	key, _ := paramsMap["key"].(string)
-
-	if key != "" {
-		val, ok := prefs[key]
-		if !ok {
-			val = map[string]any{}
-		}
-		sendResultResponse(w, map[string]any{key: val})
-	} else {
-		sendResultResponse(w, prefs)
-	}
+	sendErrorResponse(w, 501, "Commands that require having a wallet are not implemented for now.")
 }
 
 func handleJSONRPCMessagePreferenceSet(w http.ResponseWriter, params any) {
-	paramsMap, ok := params.(map[string]any)
-	if !ok {
-		sendErrorResponse(w, -32600, "Invalid params")
-		return
-	}
-
-	prefs := loadPreferences()
-
-	key, _ := paramsMap["key"].(string)
-	value := paramsMap["value"]
-
-	if key != "" && value != nil {
-		prefs[key] = value
-	}
-
-	if err := savePreferences(prefs); err != nil {
-		sendErrorResponse(w, -32000, "Failed to save preferences")
-		return
-	}
-
-	sendResultResponse(w, prefs)
+	sendErrorResponse(w, 501, "Commands that require having a wallet are not implemented for now.")
 }
 
 func handleJSONRPCMessagePublish(w http.ResponseWriter, params any) {
@@ -1063,12 +792,7 @@ func handleJSONRPCMessageSettingsClear(w http.ResponseWriter, params any) {
 }
 
 func handleJSONRPCMessageSettingsGet(w http.ResponseWriter, params any) {
-	sendResultResponse(w, map[string]any{
-		"streaming_server": "localhost:5280",
-		"save_files":       false,
-		"share_usage_data": false,
-		"download_dir":     "",
-	})
+	sendErrorResponse(w, 401, "Not exposed for now.")
 }
 
 func handleJSONRPCMessageSettingsSet(w http.ResponseWriter, params any) {
