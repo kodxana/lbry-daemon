@@ -192,6 +192,7 @@ func handleJSONRPCMessage(w http.ResponseWriter, message map[string]any) {
 
 	handler, exists := handlers[method]
 	if exists {
+		fmt.Printf("Receiving '%s' method\n", method)
 		if existsParams {
 			handler(w, params)
 			return
@@ -555,6 +556,14 @@ func handleJSONRPCMessageResolve(w http.ResponseWriter, params any) {
 
 				item = map[string]any{
 					"canonical_url": "lbry://" + uri,
+					"claim_id":      "e0e99956966e1ac7b468bc2bb5430a1841b048e1",
+					"name":          "Some Claim: " + uri,
+					"value": map[string]any{
+						"thumbnail": map[string]any{
+							"url": "https://spee.ch/d/f3b724e6ff579f07.png",
+						},
+					},
+					"_": claimMap,
 				}
 			}
 
