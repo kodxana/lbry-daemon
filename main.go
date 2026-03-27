@@ -5,6 +5,7 @@ import "net"
 import "net/http"
 import "strconv"
 import "sync"
+import "lbry/daemon/dht"
 import "lbry/daemon/stream"
 import "lbry/daemon/rpc"
 
@@ -13,6 +14,13 @@ var wg sync.WaitGroup
 func main() {
 	rpcServer := rpc.CreateServer()
 	contentServer := stream.CreateServer(nil)
+
+	wg.Go(func() {
+		fmt.Println("Starting DHT server on port 4444.")
+		node, _ := dht.NewNode(4444)
+		// node.TCPPort = 5567
+		node.Start()
+	})
 
 	wg.Go(func() {
 		fmt.Println("Starting RPC server on port 5279.")

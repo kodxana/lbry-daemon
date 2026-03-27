@@ -184,7 +184,7 @@ type Node struct {
 	tokenSecret [HashSize]byte // random secret for token generation
 }
 
-func NewNode(udpPort, tcpPort int) (*Node, error) {
+func NewNode(udpPort int) (*Node, error) {
 	var id [HashSize]byte
 	rand.Read(id[:])
 
@@ -194,7 +194,6 @@ func NewNode(udpPort, tcpPort int) (*Node, error) {
 	node := &Node{
 		ID:          id,
 		UDPPort:     udpPort,
-		TCPPort:     tcpPort,
 		routing:     NewRoutingTable(id),
 		pending:     make(map[string]chan map[string]any),
 		tokenSecret: secret,
@@ -204,7 +203,7 @@ func NewNode(udpPort, tcpPort int) (*Node, error) {
 
 func (n *Node) Start() error {
 	addr := &net.UDPAddr{Port: n.UDPPort}
-	conn, err := net.ListenUDP("udp4", addr)
+	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
 		return fmt.Errorf("dht: listen UDP: %w", err)
 	}
